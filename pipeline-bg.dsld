@@ -1,0 +1,269 @@
+node('InfraSvcOrg') {
+    def mvnHome = tool 'Maven_3_2_5'
+    env.JAVA_HOME="${tool 'JDK_7u80'}"
+    env.PATH="${env.JAVA_HOME}/bin:${mvnHome}/bin:${env.PATH}"
+    env.MAVEN_OPTS="-Xmx2048m -XX:MaxPermSize=512m"
+    def environment = "DV"
+    def BACKOUT = "false"
+    def version = Branch
+    
+    sh "git config --global http.sslVerify 'false'"
+    def Greenfield = fileLoader.fromGit('GreenfieldPipeline/GreenfieldPipeline', 'https://gitbucket.tvlport.com/git/GREENFIELD/GreenfieldAdmin.git', 'master', null, '')
+ 
+    stage 'Checkout'
+    sh "git config --global http.sslVerify 'false'"
+    if(Tagged_Release.equals("true")){
+        Greenfield.git_checkout_tag(GIT_PATH, Tag, true)
+    }
+    else{
+        Greenfield.git_checkout(GIT_PATH, Branch, true)
+    }
+    def datas = readYaml file: 'manifest.yml'
+    def Base_Service_Name = "${datas.applications[0].name}"
+    
+    stage 'Maven' 
+    if(Maven.equals("Build")){
+        wrap([$class: 'ConfigFileBuildWrapper', managedFiles: [[fileId: '59a4aaaa-5995-4e1f-9b94-75b8581c7773', targetLocation: 'settings.xml', variable: '']]]) {
+            
+            stage 'Compile UnitTest' 
+            // Complete a clean compile and unit test of my application
+            sh "mvn -U -s settings.xml clean compile test"
+	        
+            stage 'Nexus Jar Publish' 
+            // Push a Jar file of my application to Nexus
+            sh "mvn -U -s settings.xml -Pjarmaker deploy -DskipTests"
+            
+            stage 'Nexus War Publish'
+            // Push a War file of my application to Nexus
+            sh "mvn -U -s settings.xml -Pwebapp deploy -DskipTests"
+ 
+            stage 'Sonar Scan' 
+            // Greenfield.sonar()
+            
+            stage 'Fortify Scan' 
+            // Greenfield.fortify_scan()
+        }
+    } else {
+        stage 'Pull Release' 
+        Greenfield.get_release()
+    }
+    
+	stage 'Document Check' 
+    Greenfield.checkdocs(Operational_Doc)
+    
+    // Space="NonProd"
+    stage 'Deployment'
+    if(Space.equals("NonProd"))
+    {
+        stage 'Integration Deployment'
+        def nonProd = [] 
+        if(env.Region.equals("ALL")){
+            nonProd = Greenfield.getNonProdRegions()
+        } 
+        else if(env.Cluster.equals("ALL")){
+            nonProd = Greenfield.getNonProdRegion(env.Region)
+        } 
+        else {
+            nonProd = Greenfield.getNonProdCluster(env.Region, env.Cluster)
+        } 
+        try {
+        	for(currentCluster in nonProd){ 	
+                stage "Non Production $currentCluster.REGION_NAME" 
+                if(FALLBACK.equals("true")){
+                    fallback_service(currentCluster)
+                } else {
+                    deploy_service(currentCluster, environment, Base_Service_Name)
+                }
+            } // end of for Regions            
+        } catch (Exception e) {
+            println e.toString()
+            currentBuild.result = 'FAILURE'
+        }
+ 
+    } 
+    
+    if(Prepare_Release.equals("Yes")){
+        stage 'Production Readiness'
+        Greenfield.archive_md5(GIT_PATH, Branch)
+        Greenfield.archive_build(GIT_PATH, Branch, "${Base_Service_Name}-${env.BUILD_NUMBER}")
+        Greenfield.tag_build(GIT_PATH, Branch)
+    }
+ 
+    if(Space.equals("Prod")){
+        stage 'PRODUCTION LOAD'
+        def GoodMD5 = Greenfield.confirm_md5()
+        
+        if(GoodMD5.equals("true"))
+        {
+            def Regions = []
+            if(env.Region.equals("ALL")){
+                Regions = Greenfield.getRegions()
+            } 
+            else if(env.Cluster.equals("ALL")){
+                Regions = Greenfield.getRegion(env.Region)
+            } 
+            else {
+                Regions = Greenfield.getCluster(env.Cluster)
+            }
+            // Set environment
+            environment = "PN"  
+            env.https_proxy="https://atlproxy.tvlport.com:8080/"
+            try {
+                for(currentCluster in Regions){ 	
+                    stage "Production $currentCluster.REGION_NAME" 
+                    if(FALLBACK.equals("true")){
+                        fallback_service(currentCluster)
+                    } else {
+                        deploy_service(currentCluster, environment, Base_Service_Name)
+                    }
+                } // end of for Regions
+            } catch (Exception e) {
+                println e.toString()
+                currentBuild.result = 'FAILURE'
+            }
+        }
+    }
+}
+ 
+def deploy_service(targetCluster, AppDEnv, Base_Service_Name){
+ 
+    sh "git config --global http.sslVerify 'false'"
+    def Greenfield = fileLoader.fromGit('GreenfieldPipeline/GreenfieldPipeline', 'https://gitbucket.tvlport.com/git/GREENFIELD/GreenfieldAdmin.git', 'master', null, '')
+    def manifestName = "${Base_Service_Name}"  
+    def baseName = "${Base_Service_Name}"
+    def designator = "a"
+ 
+    //Replacment Block replaces real prod with NonProd Prod
+    if(Fake_Prod.equals("true") && Space.equals("Prod")){
+        def nonProd = [] 
+        nonProd = Greenfield.getNonProdRegion()
+        baseName = "${Base_Service_Name}-${targetCluster.CLUSTER_NAME}"
+        targetCluster.CLUSTER = "${nonProd.CLUSTER}"
+        targetCluster.DOMAIN = "${nonProd.DOMAIN}"
+        AppDEnv = "DV"
+    }
+    //End Replacemant Block
+    
+    Greenfield.stackato_login("https://${targetCluster.CLUSTER}","InfraSvcOrg", "${Space}")
+    
+    //Get current version and fallback versions
+    def runningApp = Greenfield.get_running_app("${baseName}.${targetCluster.DOMAIN}")
+    def application = "${baseName}-${designator}"
+ 
+    if(runningApp == application){
+    	designator = "b"
+    	application = "${baseName}-${designator}"
+    }
+    
+    println "New: ${application} Current: ${runningApp}"   
+ 
+    try {
+		
+        // Allow Access to Config Repo for Zookeeper
+        Greenfield.config_repo_nonprod_setup()
+	
+        // Allow Access to App Dynamics for Application
+        Greenfield.appdynamics_setup("${application}", "${AppDEnv}")
+        
+        // Green DP reporting service
+        // Greenfield.stackato "create-service user-provided testdb-${application} --credentials hostname:shlgnrhds003.tvlport.net --credentials port:3306 --credentials password:'' --credentials pass:uaZVC8HQC5vtKfUEBemy --credentials user:perfreporting --credentials database:perfreporting"
+	
+        // Create an application User Provided Service to support someone else calling this service from inside Cloud Foundry
+        Greenfield.stackato "create-service user-provided ${manifestName}-svc-${application} --credentials hostname:${baseName}.${targetCluster.DOMAIN} --credentials host:${baseName}.${targetCluster.DOMAIN} --credentials port:80 --credentials password:''"
+		
+        // Create an application User Provided Service to support holding my application configurations via VCAPs (until Zookeeper support this feature)
+        Greenfield.stackato "create-service user-provided ${manifestName}-svc-config-${application} --credentials hostname:'' --credentials port:'' --credentials password:''"
+			
+        // Push my Application as an "integration" instance
+        Greenfield.stackato "push -n --nostart --reset --as ${application}"
+			
+        // Download and install AppDynamics Agent
+        Greenfield.appdynamics_config("${application}", "${baseName}")
+        
+        // Start Application after all the configs are setup
+        Greenfield.stackato "start ${application}"
+ 
+        // Create an application route to support internal call
+        Greenfield.stackato "map ${application} ${application}.${targetCluster.CLUSTER.replace("api.", "")}"
+ 
+        //Insert  Tests here
+        def Name = sh(returnStdout: true, script: "curl -X GET 'https://${application}.${targetCluster.CLUSTER.replace("api.", "")}/rest/echo/hello/12345'")
+        println "${Name}"
+        if(!Name.contains(Assert_value)){
+            throw new Throwable()
+        }
+ 
+        BACKOUT = "true"
+        // Create an application route to support a cloud to cloud service test that uses a present - or not present User Provided Service
+        Greenfield.stackato "map ${application} ${baseName}-db.${targetCluster.DOMAIN}"
+		
+        // Create an application route to support F5 Access
+        Greenfield.stackato "map ${application} ${baseName}.${targetCluster.DOMAIN}"
+ 
+        // Remove old version from route for a present - or not present User Provided Service
+        Greenfield.stackato "unmap ${runningApp} ${baseName}-db.${targetCluster.DOMAIN}"
+ 
+        // Remove old version from route
+        Greenfield.stackato "unmap ${runningApp} ${baseName}.${targetCluster.DOMAIN}"
+ 
+        // Stop fallback to save memory
+        Greenfield.stackato "stop ${runningApp}"
+        
+		// Final Verification
+        Name = sh(returnStdout: true, script: "curl -X GET 'https://${baseName.toLowerCase()}.${targetCluster.DOMAIN}/rest/echo/hello/12345'")
+        println "${Name}"
+        if(!Name.contains(Assert_value2)){
+            throw new Throwable()
+        }           
+            
+        BACKOUT = "false"
+ 
+    } catch (Exception e){
+        if(BACKOUT.equals("true")){
+            Greenfield.stackato "start ${runningApp}"
+            Greenfield.stackato "map ${runningApp} ${baseName}.${targetCluster.DOMAIN}"
+            Greenfield.stackato "map ${runningApp} ${baseName}-db.${targetCluster.DOMAIN}"
+            Greenfield.stackato "unmap ${appName} ${baseName}.${targetCluster.DOMAIN}"
+            Greenfield.stackato "unmap ${appName} ${baseName}-db.${targetCluster.DOMAIN}"
+        }
+        throw e
+    } 
+    finally{
+        Greenfield.stackato_logout()
+    }
+}
+ 
+def fallback_service(Base_Service_Name, targetCluster){
+    sh "git config --global http.sslVerify 'false'"
+    def Greenfield = fileLoader.fromGit('GreenfieldPipeline/GreenfieldPipeline', 'https://gitbucket.tvlport.com/git/GREENFIELD/GreenfieldAdmin.git', 'master', null, '')
+    def manifestName = "${Base_Service_Name}"  
+    def baseName = "${Base_Service_Name}"
+    def designator = "a"
+ 
+    //Replacment Block replaces real prod with NonProd Prod
+    if(Fake_Prod.equals("true") && Space.equals("Prod")){
+        baseName = "${Base_Service_Name}-${targetCluster.CLUSTER_NAME}"
+        targetCluster.CLUSTER = "api.adc-dv-r3yc172-gf.travelport.com"
+        targetCluster.DOMAIN = "adc-dv-gf.travelport.com"
+    }
+    //End Replacemant Block
+ 
+    Greenfield.stackato_login("https://${targetCluster.CLUSTER}","InfraSvcOrg", "${Space}")
+ 
+    //Get current version and fallback versions
+    def runningApp = Greenfield.get_running_app("${baseName}.${targetCluster.DOMAIN}")
+	def application = "${baseName}-${designator}"
+    
+    if(runningApp.equals(FBapplication)) {
+    	designator = "b"
+    	application = "${baseName}-${designator}"
+    }
+    
+    Greenfield.stackato "start ${application}"
+    Greenfield.stackato "map ${application} ${baseName}.${targetCluster.DOMAIN}"
+    Greenfield.stackato "map ${application} ${baseName}-db.${targetCluster.DOMAIN}"
+    Greenfield.stackato "unmap ${runningApp} ${baseName}.${targetCluster.DOMAIN}"
+    Greenfield.stackato "unmap ${runningApp} ${baseName}-db.${targetCluster.DOMAIN}"
+    
+    Greenfield.stackato_logout()
+}

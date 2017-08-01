@@ -1,0 +1,16 @@
+applications:
+- name: greenecho
+  memory: 2048M
+  path: target/GreenEchoService.war
+  buildpack: https://github.com/cloudfoundry/java-buildpack.git#v3.16
+  timeout: 180
+  instances: 2
+  services:
+   - appdynamics_${name}
+   - greenecho-svc-config-${name} 
+   - greenecho-svc-${name} 
+   - config-repo
+  env:
+    JBP_CONFIG_TOMCAT: '[tomcat: { version: 8.0.+ }]'
+    JBP_CONFIG_DYNA_TRACE_AGENT: '[ version: 6.3.0_+ ]'
+    JBP_CONFIG_OPEN_JDK_JRE: '[jre: { version: 1.8.0_+ }]'

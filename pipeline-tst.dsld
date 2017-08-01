@@ -1,0 +1,124 @@
+node('gf-slave') {
+    def mvnHome = tool 'Maven_3_2_5'
+    env.JAVA_HOME="${tool 'JDK_7u80'}"
+    env.PATH="${env.JAVA_HOME}/bin:${mvnHome}/bin:${env.PATH}"
+    env.MAVEN_OPTS="-Xmx2048m -XX:MaxPermSize=512m"
+	
+    sh "git config --global http.sslVerify 'false'"
+    def Greenfield = fileLoader.fromGit('GreenfieldPipeline/GreenfieldPipeline', 'https://gitbucket.tvlport.com/git/GREENFIELD/GreenfieldAdmin.git', 'master', null, '')
+
+    stage 'Checkout'
+    sh "git config --global http.sslVerify 'false'"
+    Greenfield.git_checkout 'https://gitbucket.tvlport.com/git/GREENFIELD/GreenEcho.git' 
+    
+    sh "git config --global http.sslVerify 'false'"
+    Greenfield.git_checkout 'https://gitbucket.tvlport.com/git/GREENFIELD/GreenEcho.git', Current_Build 
+    
+    sh "git config --global http.sslVerify 'false'"
+    Greenfield.git_checkout 'https://gitbucket.tvlport.com/git/GREENFIELD/GreenEcho.git', Current_Build, true 
+
+    stage 'Document Check'
+    Greenfield.checkdocs 'https://doclibrary.travelport.com/dat/Data%20Center%20Operations/Cloud%20Implementations/Greenfield%20Echo/Green%20Echo%20Operational%20Support.docx'
+    
+    stage 'Maven Build'
+	wrap([$class: 'ConfigFileBuildWrapper', managedFiles: [[fileId: 'org.jenkinsci.plugins.configfiles.maven.MavenSettingsConfig1448996998298', targetLocation: 'settings.xml', variable: '']]]) {
+        stage 'Compile UnitTest'
+	    // Complete a clean compile and unit test of my application
+        sh "mvn -U -s settings.xml clean compile test"
+	
+        stage 'Nexus Jar Publish'
+		// Push a Jar file of my application to Nexus
+        sh "mvn -U -s settings.xml -Pjarmaker deploy -DskipTests"
+	
+        stage 'Nexus War Publish'
+		// Push a War file of my application to Nexus
+        sh "mvn -U -s settings.xml -Pwebapp deploy -DskipTests"
+	        
+        stage 'Sonar'
+        // Greenfield.sonar()
+    	      
+        stage 'Fortify Scan'
+        //Greenfield.fortify_scan()
+        //emailext body: """STARTED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]':
+        //Check console output at &QUOT;<a href='${env.BUILD_URL}'>${env.JOB_NAME} [${env.BUILD_NUMBER}]</a>&QUOT;""", subject: 'Please Approve Security Scan', to: 'tony.owens@travelport.com'
+        //emailext attachmentsPattern: '<fileset dir="${WORKSPACE}" includes="*/*/target/*.fpr" />', body: 'Fortify FPR', subject: 'Fortify FPR', to: 'tony.owens@travelport.com'
+    }
+}
+//    stage 'Security Approval'
+//    input message: 'Secuirty Approval', ok: 'Approve', submitter: 'cf_admins'
+
+node('gf-slave') {
+    sh "git config --global http.sslVerify 'false'"
+    def Greenfield = fileLoader.fromGit('GreenfieldPipeline/GreenfieldPipeline', 'https://gitbucket.tvlport.com/git/GREENFIELD/GreenfieldAdmin.git', 'master', null, '')
+
+    stage 'Integration Deployment'
+	Greenfield.stackato_login "https://api.adc-dv-r3yc172-gf.travelport.com","InfraSvcOrg", "NonProd"
+	try {
+		//Define the Application Name
+		def appName = "greenecho-tst"
+		
+		// Allow Access to App Dynamics for Application
+		Greenfield.appdynamics_setup("${appName}", "DV")
+	    
+		// Allow Access to Config Repo for Zookeeper
+		Greenfield.config_repo_nonprod_setup()
+		
+		// Green Echo Application - Allow Access to Proxy Servers
+		// Greenfield.atlproxy_setup()
+	
+		// Green DP reporting service
+		Greenfield.stackato "create-service user-provided testdb-${appName} --credentials hostname:shlgnrhds003.tvlport.net --credentials port:3306 --credentials password:'' --credentials pass:uaZVC8HQC5vtKfUEBemy --credentials user:perfreporting --credentials database:perfreporting"
+	
+		// Create an application User Provided Service to support someone else calling this service from inside Cloud Foundry
+        Greenfield.stackato "create-service user-provided greenecho-svc-${appName} --credentials hostname:${appName}.adc-dv-gf.travelport.com --credentials host:${appName}.adc-dv-gf.travelport.com --credentials port:80 --credentials password:''"
+		
+        // Create an application User Provided Service to support holding my application configurations via VCAPs (until Zookeeper support this feature)
+		Greenfield.stackato "create-service user-provided greenecho-svc-config-${appName} --credentials hostname:'' --credentials port:'' --credentials password:''"
+			
+		// Push my Application as an "integration" instance
+        Greenfield.stackato "push -n --nostart --reset --as ${appName}"
+			
+	    // Download and install AppDynamics Agent
+        Greenfield.appdynamics_config("${appName}")
+        
+        // Start Application after all the configs are setup
+        Greenfield.stackato "start ${appName}"
+
+        // Create an application route to support a cloud to cloud service test that uses a present - or not present User Provided Service
+		Greenfield.stackato "map ${appName} ${appName}-db.adc-dv-gf.travelport.com"
+		
+		// Create an application route to support F5 Access
+		Greenfield.stackato "map ${appName} ${appName}.adc-dv-gf.travelport.com"
+
+		// Create an application route to support F5 Access
+		Greenfield.stackato "map ${appName} ${appName}.adc-dv-gf.travelport.com"
+
+	} finally {
+	    Greenfield.stackato_logout()
+    }
+
+
+    def Regions = []
+    if(env.Cluster!='ALL'){
+        Regions = Greenfield.getCluster(env.Cluster)
+    }
+    else if(env.Region=='ALL'){
+        Regions = Greenfield.getRegions()
+    } 
+    else{
+        Regions = Greenfield.getRegion(env.Region)
+    }
+
+    
+    // env.https_proxy="https://atlproxy.tvlport.com:8080/"
+
+    for(currentCluster in Regions){ 	
+        stage "Production $currentCluster.REGION_NAME"
+               Greenfield.stackato_login "https://$currentCluster.CLUSTER", "InfraSvcOrg", "Prod"
+               Greenfield.stackato_logout()          
+    } // end of for Regions
+
+    stage "Archive Build"
+    Greenfield.archive_build 'https://gitbucket.tvlport.com/git/GREENFIELD/GreenEcho.git', Current_Build, "-tst"
+    
+}
