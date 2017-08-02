@@ -1,5 +1,5 @@
 node('gf-slave') {
-    def mvnHome = tool 'Maven_3_2_5'
+    def mvnHome = tool 'maven-3.5.0'
     env.JAVA_HOME="${tool 'JDK_7u80'}"
     env.PATH="${env.JAVA_HOME}/bin:${mvnHome}/bin:${env.PATH}"
     env.MAVEN_OPTS="-Xmx2048m -XX:MaxPermSize=512m"
